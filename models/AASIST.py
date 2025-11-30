@@ -1,5 +1,5 @@
 """
-AASIST
+AASIST (with MFM integrated into Residual blocks)
 Copyright (c) 2021-present NAVER Corp.
 MIT license
 """
@@ -12,6 +12,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+class MFM(nn.Module):
+    """
+    Max-Feature-Map (MFM) activation.
+    Assumes channel dimension = 2 * out_channels and returns out_channels.
+    """
+    def __init__(self, out_channels: int):
+        super().__init__()
+        self.out_channels = out_channels
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, 2*out_channels, H, W)
+        c = self.out_channels
+        x1 = x[:, :c, :, :]
+        x2 = x[:, c:, :, :]
+        return torch.max(x1, x2)
 
 
 class GraphAttentionLayer(nn.Module):
@@ -411,57 +428,90 @@ class CONV(nn.Module):
 
 
 class Residual_block(nn.Module):
+    """
+    Residual block modified to use MFM.
+
+    nb_filts is expected to be an iterable of two ints: [in_channels, out_channels]
+    External interface unchanged: nb_filts[0] = in, nb_filts[1] = out (C).
+    Internal conv shapes:
+      conv1: in -> 2*C
+      BN
+      MFM -> C
+      conv2: C -> 2*C
+      BN
+      MFM -> C
+    Identity (downsample) conv maps in -> C (so addition is done on C).
+    """
     def __init__(self, nb_filts, first=False):
         super().__init__()
         self.first = first
 
+        in_ch = nb_filts[0]
+        out_ch = nb_filts[1]  # this is C (the external expected out)
+
         if not self.first:
-            self.bn1 = nn.BatchNorm2d(num_features=nb_filts[0])
-        self.conv1 = nn.Conv2d(in_channels=nb_filts[0],
-                               out_channels=nb_filts[1],
+            # BN on input (same as original)
+            self.bn1 = nn.BatchNorm2d(num_features=in_ch)
+
+        # conv1: in_ch -> 2*out_ch
+        self.conv1 = nn.Conv2d(in_channels=in_ch,
+                               out_channels=out_ch * 2,
                                kernel_size=(2, 3),
                                padding=(1, 1),
                                stride=1)
-        self.selu = nn.SELU(inplace=True)
 
-        self.bn2 = nn.BatchNorm2d(num_features=nb_filts[1])
-        self.conv2 = nn.Conv2d(in_channels=nb_filts[1],
-                               out_channels=nb_filts[1],
+        # BN after conv1 (on 2*C channels)
+        self.bn_after_conv1 = nn.BatchNorm2d(num_features=out_ch * 2)
+        # MFM reducing 2*C -> C
+        self.mfm1 = MFM(out_ch)
+
+        # conv2: C -> 2*C
+        self.conv2 = nn.Conv2d(in_channels=out_ch,
+                               out_channels=out_ch * 2,
                                kernel_size=(2, 3),
                                padding=(0, 1),
                                stride=1)
 
-        if nb_filts[0] != nb_filts[1]:
+        # BN after conv2 (on 2*C channels)
+        self.bn_after_conv2 = nn.BatchNorm2d(num_features=out_ch * 2)
+        # MFM reducing 2*C -> C
+        self.mfm2 = MFM(out_ch)
+
+        if in_ch != out_ch:
             self.downsample = True
-            self.conv_downsample = nn.Conv2d(in_channels=nb_filts[0],
-                                             out_channels=nb_filts[1],
+            # conv_downsample will map identity to out_ch (C) to match out after MFM
+            self.conv_downsample = nn.Conv2d(in_channels=in_ch,
+                                             out_channels=out_ch,
                                              padding=(0, 1),
                                              kernel_size=(1, 3),
                                              stride=1)
-
         else:
             self.downsample = False
-        self.mp = nn.MaxPool2d((1, 3))  # self.mp = nn.MaxPool2d((1,4))
+
+        self.mp = nn.MaxPool2d((1, 3))  # same as original
 
     def forward(self, x):
         identity = x
+
         if not self.first:
             out = self.bn1(x)
-            out = self.selu(out)
         else:
             out = x
-        out = self.conv1(x)
 
-        # print('out',out.shape)
-        out = self.bn2(out)
-        out = self.selu(out)
-        # print('out',out.shape)
-        out = self.conv2(out)
-        #print('conv2 out',out.shape)
+        # conv1 -> BN -> MFM
+        out = self.conv1(out)              # -> 2*C
+        out = self.bn_after_conv1(out)
+        out = self.mfm1(out)               # -> C
+
+        # conv2 -> BN -> MFM
+        out = self.conv2(out)              # expects C in -> outputs 2*C
+        out = self.bn_after_conv2(out)
+        out = self.mfm2(out)               # -> C
+
         if self.downsample:
-            identity = self.conv_downsample(identity)
+            identity = self.conv_downsample(identity)  # -> C
 
-        out += identity
+        out = out + identity
         out = self.mp(out)
         return out
 
